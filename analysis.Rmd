@@ -1,0 +1,547 @@
+library(plyr)
+library(tidyverse)
+library(readxl)
+
+hour_01_names <- c("N3", "N4", "N5", "N6", "N7")
+hour_12_names <- c("N1", "N2", "N3", "N4", "N5", "N6")
+hour_24_names <- c("N2", "N3", "N4", "N5", "N6", "N7")
+
+lipid_types <- c("acy-carnitines", "CE", "cer", "FFA", "PCandSM",
+                 "PE", "PG", "PI", "PS", "QC", "TAG1", "TAG2")
+
+metob_types <- c("neg1", "neg2", "pos1", "pos2")
+
+read_lipids <- function(prefix, suffix, tp, tp_names, types, incl_suffix = F) {
+  lapply(types, function(type){
+    
+    all_names <- lapply(tp_names, function(n) {
+      veh_name = paste0("veh_", n)
+
+      veh = read_xlsx(paste0(prefix, "/", type, "/", "Veh-", suffix,
+                             tp, n, "_", type, "_results.xlsx")) %>%
+        rename(lipid = `Lipid name`) %>%
+        rename(!!veh_name := `Total Intensity`) %>%
+        mutate(type = type) %>%
+        na.omit
+
+      abe_name = paste0("Abe_", n)
+      
+      abe = read_xlsx(paste0(prefix, "/", type, "/", "Ab-", suffix,
+                             tp, n, "_", type, "_results.xlsx")) %>%
+        rename(lipid = `Lipid name`) %>%
+        rename(!!abe_name := `Total Intensity`) %>%
+        mutate(type = type) %>%
+        na.omit
+      
+      blank = read_xlsx(paste0(prefix, "/", type, "/", "Blank_",
+                               if_else(incl_suffix, paste0(suffix, "_"),
+                                                    ""),
+                               type, "_results.xlsx")) %>%
+        rename(lipid = `Lipid name`) %>%
+        rename(Blank = `Total Intensity`)
+
+      merge(veh, abe) %>% merge(blank) %>% as_tibble
+      
+    })
+
+    Reduce(function(x, y) merge(x, y), all_names)
+  }) %>% bind_rows() %>% as_tibble()
+}
+
+cl_01h <- read_lipids("raw_data/cells-lipids", "cl", "_1h_",
+                      hour_01_names, lipid_types)
+cl_12h <- read_lipids("raw_data/cells-lipids", "cl", "_12h_",
+                      hour_12_names, lipid_types)
+cl_24h <- read_lipids("raw_data/cells-lipids", "cl", "_24h_",
+                      hour_24_names, lipid_types)
+
+ml_01h <- read_lipids("raw_data/media-lipids", "medium", "_1h_",
+                      hour_01_names, lipid_types)
+ml_12h <- read_lipids("raw_data/media-lipids", "medium", "_12h_",
+                      hour_12_names, lipid_types)
+ml_24h <- read_lipids("raw_data/media-lipids", "medium", "_24h_",
+                      hour_24_names, lipid_types)
+
+cm_01h <- read_lipids("raw_data/polar", "cm", "_1h_",
+                      hour_01_names, metob_types, T)
+cm_12h <- read_lipids("raw_data/polar", "cm", "_12h_",
+                      hour_12_names, metob_types, T)
+cm_24h <- read_lipids("raw_data/polar", "cm", "_24h_",
+                      hour_24_names, metob_types, T)
+
+mm_01h <- read_lipids("raw_data/polar", "mm", "_1h_",
+                      hour_01_names, metob_types, T)
+mm_12h <- read_lipids("raw_data/polar", "mm", "_12h_",
+                      hour_12_names, metob_types, T)
+mm_24h <- read_lipids("raw_data/polar", "mm", "_24h_",
+                      hour_24_names, metob_types, T)
+
+
+### EdgeR analysis
+
+## Define edgeR variables
+
+Since the names and number of experiments for each **time point** is different, we create separate analysis variables for each of the **time points**. Each *time point* and *experiment type* has three possibilities: *Blank*, *AB* (for A-beta treated cells), and *VH* for cells treated with vehicle. 
+
+
+library(edgeR)
+
+# Groups for 01h
+gr_01h = c("Blank",
+           "VH", "AB", "VH", "AB", "VH", "AB",
+           "VH", "AB", "VH", "AB") %>%
+  factor(levels = c("Blank", "AB", "VH"))
+
+design_01h = model.matrix(~gr_01h)
+
+contrasts_01h = makeContrasts(
+  H = gr_01hAB - gr_01hVH,
+  levels = design_01h
+)
+
+# Groups for 12h
+gr_12h = c("Blank",
+           "VH", "AB", "VH", "AB", "VH", "AB",
+           "VH", "AB", "VH", "AB", "VH", "AB") %>%
+  factor(levels = c("Blank", "AB", "VH"))
+
+design_12h = model.matrix(~gr_12h)
+
+contrasts_12h = makeContrasts(
+  H = gr_12hAB - gr_12hVH,
+  levels = design_12h
+)
+
+# Groups for 24h
+gr_24h = c("Blank",
+           "VH", "AB", "VH", "AB", "VH", "AB",
+           "VH", "AB", "VH", "AB", "VH", "AB") %>%
+  factor(levels = c("Blank", "AB", "VH"))
+
+design_24h = model.matrix(~gr_24h)
+
+contrasts_24h = makeContrasts(
+  H = gr_24hAB - gr_24hVH,
+  levels = design_24h
+)
+
+
+## Define function for statistical significance and perform initial analysis
+
+
+perform_analysis_raw <- function(counts, design_mat, gr) {
+
+  data.edgeR <- DGEList(counts = counts %>%
+                                    na.omit %>%
+                                    mutate(lipid = make.unique(lipid)) %>%
+                                    select(-Transition, -type) %>%
+                                    column_to_rownames("lipid"),
+                        group = gr
+  )
+
+  data.edgeR <- calcNormFactors(data.edgeR, method="TMM")
+  data.edgeR <- estimateCommonDisp(data.edgeR, design=design_mat)
+  data.edgeR
+}
+
+calculate_significance <- function(dge, contrast) {
+  dge %>%
+    glmFit() %>%
+    glmLRT(contrast = contrast)
+}
+
+cl_01h %>%
+  perform_analysis_raw(design_01h, gr_01h) %>%
+  calculate_significance(contrasts_01h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+ml_01h %>%
+  perform_analysis_raw(design_01h, gr_01h) %>%
+  calculate_significance(contrasts_01h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+cm_01h %>%
+  perform_analysis_raw(design_01h, gr_01h) %>%
+  calculate_significance(contrasts_01h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+mm_01h %>%
+  perform_analysis_raw(design_01h, gr_01h) %>%
+  calculate_significance(contrasts_01h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+cl_12h %>%
+  perform_analysis_raw(design_12h, gr_12h) %>%
+  calculate_significance(contrasts_12h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+ml_12h %>%
+  perform_analysis_raw(design_12h, gr_12h) %>%
+  calculate_significance(contrasts_12h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+cm_12h %>%
+  perform_analysis_raw(design_12h, gr_12h) %>%
+  calculate_significance(contrasts_12h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+mm_12h %>%
+  perform_analysis_raw(design_12h, gr_12h) %>%
+  calculate_significance(contrasts_12h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+cl_24h %>%
+  perform_analysis_raw(design_24h, gr_24h) %>%
+  calculate_significance(contrasts_24h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+ml_24h %>%
+  perform_analysis_raw(design_24h, gr_24h) %>%
+  calculate_significance(contrasts_24h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+cm_24h %>%
+  perform_analysis_raw(design_24h, gr_24h) %>%
+  calculate_significance(contrasts_24h) %>%
+  topTags(30) %>%as.data.frame() %>% as_tibble()
+
+mm_24h %>%
+  perform_analysis_raw(design_24h, gr_24h) %>%
+  calculate_significance(contrasts_24h) %>%
+  topTags(30) %>% as.data.frame() %>% as_tibble()
+
+
+write_summary_and_results <- function(tp, design, gr, contrasts, name) {
+  tp %>%
+    perform_analysis_raw(design, gr) %>%
+    calculate_significance(contrasts) %>%
+    topTags(30000) %>%
+    as.data.frame() %>%
+    rownames_to_column("lipid") %>%
+    merge(tp) %>%
+    as_tibble() %>%
+    arrange(FDR) -> results
+
+  write_csv(results, paste0("results/", name, "_full.csv"))
+  
+  results %>%
+    group_by(type) %>%
+    summarise(ab = sum(logFC < 0 & FDR < 0.1),
+              ve = sum(logFC > 0 & FDR < 0.1)) %>%
+    write_csv(paste0("results/", name, "_summary.csv"))
+}
+
+dir.create("results", F)
+
+cl_01h %>% write_summary_and_results(design_01h, gr_01h, contrasts_01h, "cl_01h")
+
+ml_01h %>% write_summary_and_results(design_01h, gr_01h, contrasts_01h, "ml_01h")
+
+cm_01h %>% write_summary_and_results(design_01h, gr_01h, contrasts_01h, "cm_01h")
+
+mm_01h %>% write_summary_and_results(design_01h, gr_01h, contrasts_01h, "mm_01h")
+
+cl_12h %>% write_summary_and_results(design_12h, gr_12h, contrasts_12h, "cl_12h")
+
+ml_12h %>% write_summary_and_results(design_12h, gr_12h, contrasts_12h, "ml_12h")
+
+cm_12h %>% write_summary_and_results(design_12h, gr_12h, contrasts_12h, "cm_12h")
+
+mm_12h %>% write_summary_and_results(design_12h, gr_12h, contrasts_12h, "mm_12h")
+
+cl_24h %>% write_summary_and_results(design_24h, gr_24h, contrasts_24h, "cl_24h")
+
+ml_24h %>% write_summary_and_results(design_24h, gr_24h, contrasts_24h, "ml_24h")
+
+cm_24h %>% write_summary_and_results(design_24h, gr_24h, contrasts_24h, "cm_24h")
+
+mm_24h %>% write_summary_and_results(design_24h, gr_24h, contrasts_24h, "mm_24h")
+
+
+### EdgeR plots
+
+#### PCA
+
+
+source("ggbiplot.R")
+
+get_DE_lipids <- function(counts, design_mat, gr, contrasts, p.value = 0.1) {
+  dls <-
+    counts %>%
+    perform_analysis_raw(design_mat, gr) %>%
+    calculate_significance(contrasts) %>%
+    decideTestsDGE(p.value = p.value)
+  
+  rownames(dls)[dls %>% as.logical()]
+}
+
+make_pca_plot <- function(tp, design_mat, gr, contrasts,
+                          title = "PCA plot",
+                          ellipse = T, var.axes = F,
+                          labels = NULL) {
+  
+  tp_edger <-
+    tp %>%
+    get_DE_lipids(design_mat, gr, contrasts)
+  
+  if(length(tp_edger) == 0) {
+    cat("No significant lipids for ", title)
+    return()
+  }
+  
+  if(length(tp_edger) == 1) {
+    cat("Single significant lipids for ", title, " is ", tp_edger[1])
+    return()
+  }
+  
+  tp %>%
+    na.omit %>%
+    mutate(lipid = make.unique(lipid)) %>%
+    filter(lipid %in% tp_edger) %>%
+    select(-Transition, -type, -Blank) %>%
+    column_to_rownames("lipid") %>%
+    as.matrix() %>%
+    t %>%
+    prcomp(center = T, scale = T) ->
+    prcomp_data
+  
+  groups = NULL
+  
+  tp %>%
+    select(-Transition, -type, -Blank, -lipid) %>%
+    colnames() ->
+    labels.tmp
+
+  groups = substr(labels.tmp, 1, 3)
+  
+  if (!is.null(labels)) {
+    labels = labels.tmp
+  }
+
+  prcomp_data %>%
+    ggbiplot(ellipse = ellipse,
+             labels = labels,
+             groups = groups,
+             var.axes = var.axes
+             ) +
+    ggtitle(title) +
+    theme(panel.grid = element_blank(),
+          panel.background = element_blank(),
+          panel.border = element_rect("transparent", "black"),
+          legend.key = element_blank())
+}
+
+
+
+svglite::svglite("figures/primary_pca_cl_01h.svg")
+cl_01h %>%
+  make_pca_plot(design_01h, gr_01h, contrasts_01h, "Cell Lipids at 01H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_ml_01h.svg")
+ml_01h %>%
+  make_pca_plot(design_01h, gr_01h, contrasts_01h, "Media Lipids at 01H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_cm_01h.svg")
+cm_01h %>%
+  make_pca_plot(design_01h, gr_01h, contrasts_01h, "Cell Metabolites at 01H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_mm_01h.svg")
+mm_01h %>%
+  make_pca_plot(design_01h, gr_01h, contrasts_01h, "Media Metabolites at 01H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_cl_12h.svg")
+cl_12h %>%
+  make_pca_plot(design_12h, gr_12h, contrasts_12h, "Cell Lipids at 12H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_ml_12h.svg")
+ml_12h %>%
+  make_pca_plot(design_12h, gr_12h, contrasts_12h, "Media Lipids at 12H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_cm_12h.svg")
+cm_12h %>%
+  make_pca_plot(design_12h, gr_12h, contrasts_12h, "Cell Metabolites at 12H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_mm_12h.svg")
+mm_12h %>%
+  make_pca_plot(design_12h, gr_12h, contrasts_12h, "Media Metabolites at 12H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_cl_24h.svg")
+cl_24h %>%
+  make_pca_plot(design_12h, gr_12h, contrasts_12h, "Cell Lipids at 24H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_ml_24h.svg")
+ml_24h %>%
+  make_pca_plot(design_12h, gr_12h, contrasts_12h, "Media Lipids at 24H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_cm_24h.svg")
+cm_24h %>%
+  make_pca_plot(design_12h, gr_12h, contrasts_12h, "Cell Metabolites at 24H")
+dev.off()
+
+svglite::svglite("figures/primary_pca_mm_24h.svg")
+mm_24h %>%
+  make_pca_plot(design_12h, gr_12h, contrasts_12h, "Media Metabolites at 24H")
+dev.off()
+
+
+#### Heatmaps
+
+make_heatmap <- function(tp, design_mat, gr, contrasts, title = "Heat-map") {
+  
+  DElist <-
+    tp %>%
+    get_DE_lipids(design_mat, gr, contrasts)
+
+  if(length(DElist) == 0) {
+    cat("No significant lipids for ", title)
+    return()
+  }
+
+  if(length(DElist) == 1) {
+    cat("Single significant lipids for ", title, " is ", DElist[1])
+    return()
+  }
+
+  tp %>%
+    mutate(lipid = make.unique(lipid)) %>%
+    filter(lipid %in% DElist) %>%
+    select(-Transition, -type) %>%
+    mutate_if(is.numeric, log2) %>%
+    mutate_if(is.numeric, list(~ . - Blank)) %>%
+    select(-Blank) %>%
+    column_to_rownames("lipid") %>%
+    as.matrix() %>%
+    pheatmap::pheatmap(main = title)
+}
+svglite::svglite("figures/primary_heatmap_cl_01h.svg")
+cl_01h %>%
+  make_heatmap(design_01h, gr_01h, contrasts_01h, "Cell Lipids at 01H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_ml_01h.svg")
+ml_01h %>%
+  make_heatmap(design_01h, gr_01h, contrasts_01h, "Media Lipids at 01H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_cm_01h.svg")
+cm_01h %>%
+  make_heatmap(design_01h, gr_01h, contrasts_01h, "Cell Metabolites at 01H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_mm_01h.svg")
+mm_01h %>%
+  make_heatmap(design_01h, gr_01h, contrasts_01h, "Media Metabolites at 01H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_cl_12h.svg")
+cl_12h %>%
+  make_heatmap(design_12h, gr_12h, contrasts_12h, "Cell Lipids at 12H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_ml_12h.svg")
+ml_12h %>%
+  make_heatmap(design_12h, gr_12h, contrasts_12h, "Media Lipids at 12H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_cm_12h.svg")
+cm_12h %>%
+  make_heatmap(design_12h, gr_12h, contrasts_12h, "Cell Metabolites at 12H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_mm_12h.svg")
+mm_12h %>%
+  make_heatmap(design_12h, gr_12h, contrasts_12h, "Media Metabolites at 12H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_cl_24h.svg")
+cl_24h %>%
+  make_heatmap(design_12h, gr_12h, contrasts_12h, "Cell Lipids at 24H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_ml_24h.svg")
+ml_24h %>%
+  make_heatmap(design_12h, gr_12h, contrasts_12h, "Media Lipids at 24H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_cm_24h.svg")
+cm_24h %>%
+  make_heatmap(design_12h, gr_12h, contrasts_12h, "Cell Metabolites at 24H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_mm_24h.svg")
+mm_24h %>%
+  make_heatmap(design_12h, gr_12h, contrasts_12h, "Media Metabolites at 24H")
+dev.off()
+
+
+make_heatmap2 <- function(tp.ml, tp.cl, design_mat, gr, contrasts, title = "Heat-map") {
+  tp.ml %>%
+    perform_analysis_raw(design_mat, gr) %>%
+    calculate_significance(contrasts) %>%
+    topTags(3000) %>%
+    as.data.frame() %>%
+    rownames_to_column("lipid") %>%
+    select(lipid, logFC, FDR) %>%
+    rename(ML.lfc = logFC, ML.FDR = FDR) ->
+    ml
+  
+  tp.cl %>%
+    perform_analysis_raw(design_mat, gr) %>%
+    calculate_significance(contrasts) %>%
+    topTags(3000) %>%
+    as.data.frame() %>%
+    rownames_to_column("lipid") %>%
+    select(lipid, logFC, FDR) %>%
+    rename(CL.lfc = logFC, CL.FDR = FDR) ->
+    cl
+
+  merge(ml, cl, all = T) %>%
+    as_tibble() %>%
+    filter(CL.FDR < 0.1 | ML.FDR < 0.1) %>%
+    gather(key, value, -lipid, -CL.FDR, -ML.FDR) %>%
+    mutate(significant = ifelse(key == "ML.lfc", ML.FDR < 0.1, CL.FDR < 0.1)) %>%
+    ggplot(aes(key, lipid, fill = value, color = significant)) +
+    geom_tile(size = 1.0) +
+    scale_fill_gradient2() +
+    scale_color_manual(values = c("FALSE" = "black", "TRUE" = "yellow")) +
+    scale_y_discrete(expand = c(0,0)) +
+    scale_x_discrete(expand = c(0,0)) +
+    cowplot::theme_cowplot() +
+    theme(axis.title = element_blank()) +
+    ggtitle((title))
+}
+svglite::svglite("figures/primary_heatmap_lipids_01h.svg")
+make_heatmap2(ml_01h, cl_01h, design_01h, gr_01h, contrasts_01h, "Lipids at 01H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_lipids_12h.svg")
+make_heatmap2(ml_12h, cl_12h, design_12h, gr_12h, contrasts_12h, "Lipids at 12H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_lipids_24h.svg")
+make_heatmap2(ml_24h, cl_24h, design_24h, gr_24h, contrasts_24h, "Lipids at 24H")
+dev.off()
+
+
+svglite::svglite("figures/primary_heatmap_metabs_01h.svg")
+make_heatmap2(mm_01h, cm_01h, design_01h, gr_01h, contrasts_01h, "Metabolites at 01H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_metabs_12h.svg")
+make_heatmap2(mm_12h, cm_12h, design_12h, gr_12h, contrasts_12h, "Metabolites at 12H")
+dev.off()
+
+svglite::svglite("figures/primary_heatmap_metabs_24h.svg")
+make_heatmap2(mm_24h, cm_24h, design_24h, gr_24h, contrasts_24h, "Metabolites at 24H")
+dev.off()
+
