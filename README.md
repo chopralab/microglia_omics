@@ -2,7 +2,7 @@
 
 This project contains all the omics data used and all the scripts which were developed to do the analysis, and figure making. The analysis.Rmd scripts which will do the analysis and separate scripts heat_maps.R and scatter_plots.R were provided to make heat maps and scatter plots figures.
 
-All the analyzed data can be accessed through the web app:
+All the analyzed data can be accessed through the web app: http://microgliaomics-chopralab.appspot.com/
 
 ## Requirements
 * R version 4.0.2
